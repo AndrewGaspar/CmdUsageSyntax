@@ -4,7 +4,10 @@ $shortParameterSwitchSyntax = "(?<short_parameter_switch>-\w+)"
 $longParameterSwitchSyntax = "(?<long_parameter_switch>--\w[\w-]+)"
 $parameterSwitchSyntax = "(?<parameter_switch>$shortParameterSwitchSyntax|$longParameterSwitchSyntax|$windowsParameterSyntax)"
 $argumentNameSyntax = "(?<argument_name>\w[\w-\.\|]*)"
+
 $argumentSyntax = "(?<argument>\<$argumentNameSyntax\>)"
+# $manyArgumentSyntax = "(?<first_argument>$argumentSyntax)(?: \| (?<rest_arguments>(?:$argumentSyntax \| )*$argumentSyntax))?"
+
 $assignmentArgumentSyntax = "(?<assignment_argument>(?<argument_delimiter>=)$argumentSyntax)"
 $windowsAssignmentArgumentSyntax = "(?<windows_assignment_argument>\:$argumentNameSyntax)"
 $explicitSeparationSyntax = "--"
@@ -63,6 +66,14 @@ class BracketedNode : Node {
     [Node[]]$Contents
 }
 
+class GroupedNode : Node {
+    [Node[]]$Nodes
+}
+
+class OrNode : Node {
+    [Node[]]$Groups
+}
+
 function IsEndOfToken($character) {
     return (IsWhitespaceToken $character) -or `
         (IsOpenBracketToken($character)) -or `
@@ -75,6 +86,10 @@ function IsWhitespaceToken($character) {
 
 function IsOpenBracketToken($character) {
     return $character -match '[\{\[\(]'
+}
+
+function IsCloseBracketToken($character) {
+    return $character -match '[\}\]\)]'
 }
 
 function GetCloseBracket($character) {
@@ -95,6 +110,7 @@ class SyntaxTreeBuilderContext {
     [int]$CurrentTextIndex
     [string]$Text
     [ParameterNode]$CurrentParameter
+    [OrNode]$LeftOperand
 }
 
 
@@ -179,18 +195,43 @@ function HandleNewNode([SyntaxTreeBuilderContext]$context, [Node]$node) {
         $node
         $node = $null
     }
-    
-    # don't need to capture white space characters, they just separate tokens
-    # don't want to skip over capture of = and bracket characters, however
-    # if(IsWhitespaceToken $text[$i]) {
-    #     $updateCurrentIter++
-    # }
+}
+
+function SplitOnOrOperators([string]$text) {
+    & {
+        $lastElement = 0
+        for($i = 0; $i -lt $text.Length; $i++) {
+            if(IsOpenBracketToken $text[$i]) {
+                $openBracket = $text[$i]
+                $closeBracket = GetCloseBracket $text[$i]
+                
+                $i = IndexOfClosingBracket $openBracket $closeBracket $text $i
+            } elseif('|' -eq $text[$i]) {
+                $text.Substring($lastElement, $i - $lastElement).Trim()
+                $lastElement = $i + 1
+            }
+        }
+
+        $text.Substring($lastElement, $i - $lastElement).Trim()
+    } | Where-Object { $_ }
 }
 
 function BuildSyntaxTree($text) {
     $context = New-Object SyntaxTreeBuilderContext -Property @{
         Text = $text
         CurrentTextIndex = 0
+    }
+    
+    $elements = SplitOnOrOperators $text
+    if($elements.Count -gt 1) {
+        return New-Object OrNode -Property @{
+            Text = $text
+            Groups = [GroupedNode[]]($elements | % { 
+                New-Object GroupedNode -Property @{
+                    Text = $_
+                    Nodes = [Node[]](BuildSyntaxTree $_)
+                } })
+        }
     }
     
     for($i = 0; $i -le $text.Length; $i++) {
@@ -241,5 +282,147 @@ function BuildSyntaxTree($text) {
     
     if($context.CurrentParameter) {
         $context.CurrentParameter
+    }
+}
+
+function New-CmdUsageSyntaxNode {
+    Param(
+        [Parameter(ValueFromPipeline=$True)]
+        [string]$Usage
+    )
+    
+    process { BuildSyntaxTree $Usage }
+}
+
+class UsageElement {
+    [bool]$IsOptional = $false
+    [string]ToString() { 
+        $result = $this.InternalToString()
+        
+        if($this.IsOptional) {
+            return "[$result]"
+        } else {
+            return $result
+        }
+    }
+}
+
+class ArgumentUsage : UsageElement {
+    [string]$Name
+    [string]$Delimiter
+    
+    [string]InternalToString() {
+        return "$($this.Delimiter)<$($this.Name)>"
+    }
+}
+
+class ParameterUsage : UsageElement {
+    [string]$Parameter
+    [ArgumentUsage]$Argument
+    
+    [bool]IsSwitch() {
+        return $null -eq $this.Argument
+    }
+    
+    [string]InternalToString() {
+        
+        if($this.IsSwitch()) {
+            return $this.Parameter
+        } else {
+            return "$($this.Parameter)$($this.Argument)"
+        }
+    }
+}
+
+class CommandUsage : UsageElement {
+    [string]$Command
+    [UsageElement[]]$Elements
+    
+    [string]InternalToString() {
+        return "$($this.Command) $($this.Elements -join " ")"
+    }
+}
+
+class SetUsage : UsageElement {
+    [UsageElement[]]$Elements
+}
+
+class GroupedSetUsage : SetUsage {
+    [string]InternalToString() {
+        return $this.Elements -join " "
+    }
+}
+
+class OrSetUsage : SetUsage {
+    [string]InternalToString() {
+        return $this.Elements -Join " | "
+    }
+    
+    [string]ToString() {
+        if($this.IsOptional) {
+            return "[$($this.InternalToString())]"
+        } else {
+            return "($($this.InternalToString()))"
+        }
+    }
+}
+
+function Format-CmdUsageSyntax {
+    $nodes = $input | % { $_ }
+    
+    for($i = 0; $i -lt $nodes.Count; $i++) {
+        $node = $nodes[$i]
+    
+        if($node -is [TextNode]) {
+            return New-Object CommandUsage -Property @{
+                Command = $node.Text
+                Elements = [UsageElement[]]($nodes | select -skip ($i+1) | Format-CmdUsageSyntax)
+            }
+        } elseif($node -is [ParameterNode]) {
+            $parameter = New-Object ParameterUsage -Property @{
+                Parameter = $node.Text
+            }
+            
+            if($node.Argument) {
+                $parameter.Argument = New-Object ArgumentUsage -Property @{
+                    Name = $node.Argument.ArgumentName
+                    IsOptional = !$node.ArgumentRequired
+                }
+                
+                if($node.ArgumentDelimiter) {
+                    $parameter.Argument.Delimiter = $node.ArgumentDelimiter
+                } else {
+                    $parameter.Argument.Delimiter = " "
+                }
+            }
+            
+            $parameter
+        } elseif($node -is [ArgumentNode]) {
+            New-Object ArgumentUsage -Property @{
+                Name = $node.ArgumentName
+            }
+        } elseif($node -is [BracketedNode]) {
+            if($node.Contents.Count -eq 1) {
+                $usage = $node.Contents[0] | Format-CmdUsageSyntax
+            } else {
+                $usage = New-Object GroupedSetUsage -Property @{
+                    Elements = [UsageElement[]]($node.Contents | Format-CmdUsageSyntax)
+                }
+            }
+            if($usage) {
+                if($node.OpenBracket -eq '[') {
+                    $usage.IsOptional = $true
+                }
+                $usage
+            }
+        } elseif($node -is [OrNode]) {
+            New-Object OrSetUsage -Property @{
+                Elements = [UsageElement[]]($node.Groups | ForEach-Object {
+                    New-Object GroupedSetUsage -Property @{
+                        Elements = [UsageElement[]]($_.Nodes | Format-CmdUsageSyntax)
+                    }
+                })
+            }
+        }
     }
 }

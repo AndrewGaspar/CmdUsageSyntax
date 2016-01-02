@@ -66,7 +66,7 @@ Copyright = '(c) 2015 Andrew Gaspar. See LICENSE'
 # NestedModules = @()
 
 # Functions to export from this module
-FunctionsToExport = @("*")
+FunctionsToExport = @("*-CmdUsage*")
 
 # Cmdlets to export from this module
 # CmdletsToExport = '*'
