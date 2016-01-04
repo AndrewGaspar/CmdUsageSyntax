@@ -334,17 +334,20 @@ class ParameterUsage : UsageElement {
     }
 }
 
-class CommandUsage : UsageElement {
-    [string]$Command
-    [UsageElement[]]$Elements
-    
-    [string]InternalToString() {
-        return "$($this.Command) $($this.Elements -join " ")"
-    }
-}
-
 class SetUsage : UsageElement {
     [UsageElement[]]$Elements
+}
+
+class CommandUsage : SetUsage {
+    [string]$Command
+    
+    [string]InternalToString() {
+        return (& {
+            $this.Command
+            
+            $this.Elements
+        } | where { $_ }) -join " "
+    }
 }
 
 class GroupedSetUsage : SetUsage {
